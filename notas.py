@@ -1,635 +1,380 @@
 
 import os
 import sqlite3
+import uuid
 from pathlib import Path
 from functools import wraps
 
 from flask import (
-    Flask, request, redirect, session,
-    flash, render_template_string
+    Flask, request, redirect, url_for,
+    session, flash, render_template_string
 )
 from werkzeug.security import generate_password_hash, check_password_hash
-from markupsafe import escape
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-
-# CONFIGURAÇÕES
-app.secret_key = os.environ.get(
-    "SECRET_KEY", "troque-esta-chave-por-uma-chave-secreta"
-)
+app.secret_key = os.environ.get("SECRET_KEY", "troque-esta-chave-secreta")
 
 BASE_DIR = Path(__file__).resolve().parent
-BANCO = BASE_DIR / "boletim.db"
+UPLOAD_DIR = BASE_DIR / "static" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-CHAVE_PIX = os.environ.get("CHAVE_PIX", "COLOQUE_SUA_CHAVE_PIX")
-NOME_PIX = os.environ.get("NOME_PIX", "SEU NOME")
-VALOR = "10,00"
-
-SENHA_ADMIN = os.environ.get("SENHA_ADMIN", "Jotta@123")
-
-
-# --------------------------------------------------
-# BANCO DE DADOS
-# --------------------------------------------------
+DB = BASE_DIR / "loja.db"
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@jottastore.com").lower()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "troque-esta-senha")
 
 def conectar():
-    banco = sqlite3.connect(str(BANCO), timeout=30)
-    banco.row_factory = sqlite3.Row
-    return banco
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    return con
 
-
-def criar_banco():
-    with conectar() as banco:
-        banco.execute("""
+def iniciar_banco():
+    with conectar() as con:
+        con.execute("""
             CREATE TABLE IF NOT EXISTS usuarios (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 nome TEXT NOT NULL,
                 email TEXT UNIQUE NOT NULL,
-                senha TEXT NOT NULL,
-                status TEXT DEFAULT 'pendente',
-                comprovante TEXT
+                senha TEXT NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS produtos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome TEXT NOT NULL,
+                descricao TEXT,
+                preco REAL NOT NULL,
+                estoque INTEGER NOT NULL DEFAULT 0,
+                foto TEXT
             )
         """)
 
+iniciar_banco()
 
-# IMPORTANTE: executa também quando o Gunicorn inicia o app no Render.
-criar_banco()
+def login_obrigatorio(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("email"):
+            return redirect(url_for("login"))
+        return func(*args, **kwargs)
+    return wrapper
 
+def admin_obrigatorio(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin"):
+            return redirect(url_for("admin_login"))
+        return func(*args, **kwargs)
+    return wrapper
 
-# --------------------------------------------------
-# USUÁRIO E PROTEÇÃO DE PÁGINAS
-# --------------------------------------------------
+MODELO = """
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JOTTA STORE</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f5f5f5;color:#222;font-family:Arial}
+header{background:#111;color:white;padding:20px;text-align:center}
+header h1{margin:0;color:#d6ad60}
+nav{background:#222;padding:13px;text-align:center}
+nav a{color:white;text-decoration:none;margin:8px;font-size:14px}
+main{max-width:1050px;margin:25px auto;padding:15px}
+.card{background:white;padding:20px;border-radius:12px;margin-bottom:18px}
+input,textarea,button{width:100%;padding:12px;margin:7px 0;border:1px solid #ddd;border-radius:7px}
+button{background:#111;color:white;border:0;cursor:pointer}
+button:hover{background:#444}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:18px}
+.produto{background:white;border-radius:12px;padding:12px}
+.produto img{width:100%;height:220px;object-fit:cover;border-radius:8px}
+.preco{font-size:20px;font-weight:bold;color:#9b742e}
+a{color:#9b742e}
+.mensagem{padding:10px;background:#eee;margin:10px 0;border-radius:7px}
+</style>
+</head>
+<body>
+<header><h1>JOTTA STORE</h1><p>Estilo que combina com você</p></header>
+<nav>
+<a href="/">Início</a>
+<a href="/carrinho">Carrinho</a>
+{% if session.get('email') %}<a href="/sair">Sair</a>{% else %}
+<a href="/login">Entrar</a><a href="/cadastro">Criar conta</a>{% endif %}
+<a href="/admin/login">Administrador</a>
+</nav>
+<main>
+{% with mensagens = get_flashed_messages() %}
+{% for m in mensagens %}<div class="mensagem">{{m}}</div>{% endfor %}
+{% endwith %}
+{{conteudo|safe}}
+</main>
+</body>
+</html>
+"""
 
-def usuario_atual():
-    usuario_id = session.get("usuario")
-
-    if not usuario_id:
-        return None
-
-    with conectar() as banco:
-        return banco.execute(
-            "SELECT * FROM usuarios WHERE id = ?",
-            (usuario_id,)
-        ).fetchone()
-
-
-def proteger(funcao):
-    @wraps(funcao)
-    def verificar(*args, **kwargs):
-        if not usuario_atual():
-            return redirect("/login")
-        return funcao(*args, **kwargs)
-    return verificar
-
-
-def liberar(funcao):
-    @wraps(funcao)
-    def verificar(*args, **kwargs):
-        usuario = usuario_atual()
-
-        if not usuario:
-            return redirect("/login")
-
-        if usuario["status"] != "aprovado":
-            return redirect("/pagamento")
-
-        return funcao(*args, **kwargs)
-    return verificar
-
-
-# --------------------------------------------------
-# VISUAL DO SITE
-# --------------------------------------------------
-
-def pagina(titulo, conteudo):
-    usuario = usuario_atual()
-
-    menu = """
-        <a href="/">Início</a>
-        <a href="/criar-conta">Criar conta</a>
-        <a href="/login">Login</a>
-    """
-
-    if usuario:
-        menu = """
-            <a href="/boletim">Meu boletim</a>
-            <a href="/pagamento">Pagamento</a>
-            <a href="/sair">Sair</a>
-        """
-
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html lang="pt-br">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>{{ titulo }} - Meu Boletim</title>
-
-        <style>
-            * { box-sizing: border-box; }
-
-            body {
-                margin: 0;
-                background: #f1f4fa;
-                font-family: Arial, sans-serif;
-                color: #18233a;
-            }
-
-            header {
-                background: #101b35;
-                color: white;
-                padding: 22px 8%;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                flex-wrap: wrap;
-                gap: 15px;
-            }
-
-            header strong { font-size: 22px; }
-
-            header a {
-                color: white;
-                text-decoration: none;
-                margin-left: 15px;
-            }
-
-            main {
-                max-width: 850px;
-                margin: 50px auto;
-                padding: 0 18px;
-            }
-
-            .card {
-                background: white;
-                padding: 35px;
-                border-radius: 18px;
-                box-shadow: 0 8px 30px #00000010;
-            }
-
-            h1 { font-size: 30px; }
-
-            p {
-                color: #647087;
-                line-height: 1.6;
-            }
-
-            input, textarea {
-                width: 100%;
-                padding: 14px;
-                border: 1px solid #d9dfeb;
-                border-radius: 9px;
-                margin: 8px 0 18px;
-                font-size: 15px;
-            }
-
-            label { font-weight: bold; }
-
-            button, .botao {
-                display: inline-block;
-                background: #315efb;
-                color: white;
-                padding: 14px 20px;
-                border: none;
-                border-radius: 9px;
-                text-decoration: none;
-                cursor: pointer;
-                font-weight: bold;
-            }
-
-            .botao-secundario {
-                background: #101b35;
-            }
-
-            .pix {
-                background: #f0f3ff;
-                padding: 18px;
-                border-radius: 12px;
-                overflow-wrap: anywhere;
-            }
-
-            .mensagem {
-                background: #fff1c9;
-                padding: 13px;
-                border-radius: 9px;
-                margin-bottom: 15px;
-            }
-
-            table {
-                width: 100%;
-                border-collapse: collapse;
-            }
-
-            td, th {
-                padding: 10px;
-                border-bottom: 1px solid #ddd;
-                text-align: left;
-            }
-
-            @media(max-width: 600px) {
-                header { padding: 20px; }
-                header a { margin-left: 5px; }
-                .card { padding: 22px; }
-                h1 { font-size: 25px; }
-            }
-        </style>
-    </head>
-
-    <body>
-        <header>
-            <strong>MEU BOLETIM</strong>
-            <nav>{{ menu|safe }}</nav>
-        </header>
-
-        <main>
-            {% for mensagem in get_flashed_messages() %}
-                <div class="mensagem">{{ mensagem }}</div>
-            {% endfor %}
-
-            {{ conteudo|safe }}
-        </main>
-    </body>
-    </html>
-    """, titulo=titulo, conteudo=conteudo, menu=menu)
-
-
-# --------------------------------------------------
-# PÁGINA INICIAL
-# --------------------------------------------------
+def pagina(conteudo):
+    return render_template_string(MODELO, conteudo=conteudo)
 
 @app.route("/")
 def inicio():
-    return pagina("Início", """
-        <div class="card">
-            <h1>Bem-vindo ao Meu Boletim!</h1>
+    with conectar() as con:
+        produtos = con.execute("SELECT * FROM produtos ORDER BY id DESC").fetchall()
 
-            <p>
-                Organize suas notas escolares em um só lugar.
-                Acompanhe seu desempenho durante o ano letivo.
-            </p>
+    html = "<h2>Nossa coleção</h2><div class='grid'>"
+    for p in produtos:
+        foto = f"/static/uploads/{p['foto']}" if p["foto"] else ""
+        html += f"""
+        <div class='produto'>
+        <img src='{foto}' alt='Produto'>
+        <h3>{p['nome']}</h3>
+        <p>{p['descricao'] or ''}</p>
+        <p class='preco'>R$ {p['preco']:.2f}</p>
+        <p>Estoque: {p['estoque']}</p>
+        <form method='post' action='/adicionar/{p['id']}'>
+        <button>Adicionar ao carrinho</button>
+        </form></div>
+        """
+    html += "</div>"
+    if not produtos:
+        html = "<h2>Nossa coleção</h2><p>Nenhum produto cadastrado ainda.</p>"
+    return pagina(html)
 
-            <a class="botao" href="/criar-conta">CRIAR CONTA</a>
-            <a class="botao botao-secundario" href="/login">
-                FAZER LOGIN
-            </a>
-        </div>
-    """)
-
-
-# --------------------------------------------------
-# CADASTRO
-# --------------------------------------------------
-
-@app.route("/criar-conta", methods=["GET", "POST"])
-def criar_conta():
-
+@app.route("/cadastro", methods=["GET", "POST"])
+def cadastro():
     if request.method == "POST":
         nome = request.form.get("nome", "").strip()
         email = request.form.get("email", "").strip().lower()
         senha = request.form.get("senha", "")
 
         if not nome or not email or len(senha) < 6:
-            flash("Preencha todos os campos. A senha precisa ter pelo menos 6 caracteres.")
-            return redirect("/criar-conta")
+            flash("Preencha os dados. A senha precisa ter pelo menos 6 caracteres.")
+            return redirect(url_for("cadastro"))
 
         try:
-            with conectar() as banco:
-                cursor = banco.execute("""
-                    INSERT INTO usuarios (nome, email, senha)
-                    VALUES (?, ?, ?)
-                """, (
-                    nome,
-                    email,
-                    generate_password_hash(senha)
-                ))
-
-                novo_id = cursor.lastrowid
-
-            session["usuario"] = novo_id
-            return redirect("/pagamento")
-
+            with conectar() as con:
+                con.execute(
+                    "INSERT INTO usuarios (nome,email,senha) VALUES (?,?,?)",
+                    (nome, email, generate_password_hash(senha))
+                )
+            session["email"] = email
+            session["nome"] = nome
+            flash("Conta criada com sucesso!")
+            return redirect(url_for("inicio"))
         except sqlite3.IntegrityError:
-            flash("Este e-mail já está cadastrado.")
-            return redirect("/criar-conta")
+            flash("Este Gmail já está cadastrado.")
 
-        except sqlite3.Error:
-            app.logger.exception("Erro ao cadastrar usuário")
-            flash("Não foi possível realizar o cadastro. Tente novamente.")
-            return redirect("/criar-conta")
-
-    return pagina("Criar conta", """
-        <div class="card">
-            <h1>Criar minha conta</h1>
-
-            <form method="POST">
-                <label>Nome completo</label>
-                <input name="nome" required maxlength="120">
-
-                <label>E-mail</label>
-                <input name="email" type="email" required>
-
-                <label>Senha</label>
-                <input name="senha" type="password"
-                       minlength="6" required>
-
-                <button type="submit">CADASTRAR E CONTINUAR</button>
-            </form>
-
-            <p>Já possui conta? <a href="/login">Entre aqui</a>.</p>
-        </div>
+    return pagina("""
+    <div class='card'><h2>Criar conta</h2>
+    <form method='post'>
+    <input name='nome' placeholder='Seu nome' required>
+    <input name='email' type='email' placeholder='Seu Gmail' required>
+    <input name='senha' type='password' placeholder='Crie uma senha (mínimo 6 caracteres)' required>
+    <button>Criar minha conta</button>
+    </form><p>Já tem conta? <a href='/login'>Entrar</a></p></div>
     """)
-
-
-# --------------------------------------------------
-# LOGIN
-# --------------------------------------------------
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
         senha = request.form.get("senha", "")
 
-        with conectar() as banco:
-            usuario = banco.execute(
-                "SELECT * FROM usuarios WHERE email = ?",
-                (email,)
+        with conectar() as con:
+            usuario = con.execute(
+                "SELECT * FROM usuarios WHERE email=?", (email,)
             ).fetchone()
 
         if usuario and check_password_hash(usuario["senha"], senha):
             session.clear()
-            session["usuario"] = usuario["id"]
+            session["email"] = usuario["email"]
+            session["nome"] = usuario["nome"]
+            return redirect(url_for("inicio"))
 
-            if usuario["status"] == "aprovado":
-                return redirect("/boletim")
+        flash("Gmail ou senha incorretos.")
 
-            return redirect("/pagamento")
-
-        flash("E-mail ou senha incorretos.")
-
-    return pagina("Login", """
-        <div class="card">
-            <h1>Entrar na minha conta</h1>
-
-            <form method="POST">
-                <label>E-mail</label>
-                <input name="email" type="email" required>
-
-                <label>Senha</label>
-                <input name="senha" type="password" required>
-
-                <button type="submit">ENTRAR</button>
-            </form>
-
-            <p>Não tem conta? <a href="/criar-conta">Cadastre-se</a>.</p>
-        </div>
+    return pagina("""
+    <div class='card'><h2>Entrar na JOTTA STORE</h2>
+    <form method='post'>
+    <input name='email' type='email' placeholder='Seu Gmail' required>
+    <input name='senha' type='password' placeholder='Sua senha' required>
+    <button>Entrar</button>
+    </form><p>Não tem conta? <a href='/cadastro'>Cadastre-se</a></p></div>
     """)
-
-
-# --------------------------------------------------
-# PAGAMENTO
-# --------------------------------------------------
-
-@app.route("/pagamento", methods=["GET", "POST"])
-@proteger
-def pagamento():
-
-    usuario = usuario_atual()
-
-    if usuario["status"] == "aprovado":
-        return redirect("/boletim")
-
-    if request.method == "POST":
-        comprovante = request.form.get("comprovante", "").strip()
-
-        if not comprovante:
-            flash("Informe os dados do comprovante.")
-            return redirect("/pagamento")
-
-        with conectar() as banco:
-            banco.execute("""
-                UPDATE usuarios
-                SET comprovante = ?, status = 'em análise'
-                WHERE id = ?
-            """, (comprovante, usuario["id"]))
-
-        flash("Comprovante enviado! Aguarde a aprovação.")
-        return redirect("/pagamento")
-
-    return pagina("Pagamento", f"""
-        <div class="card">
-            <h1>Pagamento</h1>
-
-            <p>
-                Para solicitar a liberação do acesso,
-                realize o pagamento via Pix.
-            </p>
-
-            <div class="pix">
-                <h2>R$ {VALOR}</h2>
-
-                <p><strong>Chave Pix:</strong>
-                {escape(CHAVE_PIX)}</p>
-
-                <p><strong>Recebedor:</strong>
-                {escape(NOME_PIX)}</p>
-            </div>
-
-            <p>Status: <strong>{escape(usuario["status"])}</strong></p>
-
-            <form method="POST">
-                <label>Comprovante ou identificação do pagamento</label>
-
-                <textarea name="comprovante" required
-                    placeholder="Informe os dados ou link do comprovante"
-                ></textarea>
-
-                <button type="submit">ENVIAR COMPROVANTE</button>
-            </form>
-
-            <p>
-                O administrador verificará o recebimento antes
-                de liberar sua conta.
-            </p>
-        </div>
-    """)
-
-
-# --------------------------------------------------
-# BOLETIM
-# --------------------------------------------------
-
-@app.route("/boletim")
-@liberar
-def boletim():
-
-    usuario = usuario_atual()
-
-    return pagina("Meu boletim", f"""
-        <div class="card">
-            <h1>Olá, {escape(usuario["nome"])}!</h1>
-
-            <p>Sua conta foi aprovada.</p>
-
-            <h2>Meu boletim escolar</h2>
-
-            <p>
-                Seu acesso está liberado.
-                Aqui ficará seu controle de notas.
-            </p>
-        </div>
-    """)
-
-
-# --------------------------------------------------
-# SAIR DA CONTA
-# --------------------------------------------------
 
 @app.route("/sair")
 def sair():
     session.clear()
-    return redirect("/")
+    return redirect(url_for("inicio"))
 
+@app.route("/adicionar/<int:produto_id>", methods=["POST"])
+@login_obrigatorio
+def adicionar(produto_id):
+    with conectar() as con:
+        produto = con.execute(
+            "SELECT * FROM produtos WHERE id=?", (produto_id,)
+        ).fetchone()
 
-# --------------------------------------------------
-# ADMINISTRADOR
-# --------------------------------------------------
+    if not produto or produto["estoque"] <= 0:
+        flash("Produto indisponível.")
+    else:
+        carrinho = session.get("carrinho", {})
+        chave = str(produto_id)
+        carrinho[chave] = carrinho.get(chave, 0) + 1
+        session["carrinho"] = carrinho
+        flash("Produto adicionado ao carrinho!")
+
+    return redirect(url_for("inicio"))
+
+@app.route("/carrinho")
+@login_obrigatorio
+def carrinho():
+    carrinho = session.get("carrinho", {})
+    html = "<div class='card'><h2>Meu carrinho</h2>"
+    total = 0
+
+    with conectar() as con:
+        for pid, quantidade in carrinho.items():
+            produto = con.execute(
+                "SELECT * FROM produtos WHERE id=?", (int(pid),)
+            ).fetchone()
+            if produto:
+                subtotal = produto["preco"] * quantidade
+                total += subtotal
+                html += f"<p>{produto['nome']} — {quantidade} unidade(s) — R$ {subtotal:.2f}</p>"
+
+    html += f"<h3>Total: R$ {total:.2f}</h3>"
+    html += "<p>Entre em contato com a loja para finalizar seu pedido.</p>"
+    html += "<a href='/'>Continuar comprando</a></div>"
+    return pagina(html)
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
-
     if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
         senha = request.form.get("senha", "")
 
-        if senha == SENHA_ADMIN:
+        if email == ADMIN_EMAIL and senha == ADMIN_PASSWORD:
+            session.clear()
             session["admin"] = True
-            return redirect("/admin")
+            return redirect(url_for("admin"))
 
-        flash("Senha incorreta.")
+        flash("Dados de administrador incorretos.")
 
-    return pagina("Administração", """
-        <div class="card">
-            <h1>Área administrativa</h1>
-
-            <form method="POST">
-                <label>Senha do administrador</label>
-                <input name="senha" type="password" required>
-
-                <button type="submit">ENTRAR</button>
-            </form>
-        </div>
+    return pagina("""
+    <div class='card'><h2>Área administrativa</h2>
+    <form method='post'>
+    <input name='email' type='email' placeholder='E-mail do administrador' required>
+    <input name='senha' type='password' placeholder='Senha do administrador' required>
+    <button>Entrar no painel</button>
+    </form></div>
     """)
-
 
 @app.route("/admin")
+@admin_obrigatorio
 def admin():
+    with conectar() as con:
+        produtos = con.execute("SELECT * FROM produtos ORDER BY id DESC").fetchall()
 
-    if not session.get("admin"):
-        return redirect("/admin/login")
+    html = """
+    <div class='card'><h2>Painel da JOTTA STORE</h2>
+    <h3>Cadastrar produto</h3>
+    <form method='post' action='/admin/adicionar' enctype='multipart/form-data'>
+    <input name='nome' placeholder='Nome da roupa' required>
+    <textarea name='descricao' placeholder='Descrição'></textarea>
+    <input name='preco' type='number' step='0.01' min='0' placeholder='Preço' required>
+    <input name='estoque' type='number' min='0' placeholder='Quantidade em estoque' required>
+    <input name='foto' type='file' accept='image/*'>
+    <button>Cadastrar produto</button></form>
+    <a href='/admin/sair'>Sair do administrador</a></div>
+    <h2>Produtos cadastrados</h2>
+    """
 
-    with conectar() as banco:
-        usuarios = banco.execute(
-            "SELECT * FROM usuarios ORDER BY id DESC"
-        ).fetchall()
-
-    linhas = ""
-
-    for usuario in usuarios:
-        comprovante = escape(
-            usuario["comprovante"] or "Não enviado"
-        )
-
-        acao = ""
-
-        if usuario["status"] != "aprovado":
-            acao = f"""
-                <form method="POST"
-                      action="/admin/aprovar/{usuario['id']}">
-                    <button type="submit">Aprovar conta</button>
-                </form>
-            """
-
-        linhas += f"""
-            <tr>
-                <td>{escape(usuario["nome"])}</td>
-                <td>{escape(usuario["email"])}</td>
-                <td>{escape(usuario["status"])}</td>
-                <td>{comprovante}</td>
-                <td>{acao}</td>
-            </tr>
+    for p in produtos:
+        html += f"""
+        <div class='card'><h3>{p['nome']}</h3>
+        <p>Preço: R$ {p['preco']:.2f} | Estoque: {p['estoque']}</p>
+        <form method='post' action='/admin/editar/{p['id']}'>
+        <input name='nome' value='{p['nome']}' required>
+        <textarea name='descricao'>{p['descricao'] or ''}</textarea>
+        <input name='preco' type='number' step='0.01' min='0' value='{p['preco']}' required>
+        <input name='estoque' type='number' min='0' value='{p['estoque']}' required>
+        <button>Salvar alterações</button></form>
+        <form method='post' action='/admin/excluir/{p['id']}'>
+        <button>Excluir produto</button></form></div>
         """
+    return pagina(html)
 
-    return pagina("Administração", f"""
-        <div class="card">
-            <h1>Gerenciar pagamentos</h1>
+@app.route("/admin/adicionar", methods=["POST"])
+@admin_obrigatorio
+def admin_adicionar():
+    nome = request.form.get("nome", "").strip()
+    descricao = request.form.get("descricao", "").strip()
 
-            <p>
-                Confira o recebimento no banco antes de aprovar
-                qualquer conta.
-            </p>
+    try:
+        preco = float(request.form.get("preco", "0"))
+        estoque = int(request.form.get("estoque", "0"))
+        if preco < 0 or estoque < 0:
+            raise ValueError()
+    except ValueError:
+        flash("Preço ou estoque inválido.")
+        return redirect(url_for("admin"))
 
-            <div style="overflow-x:auto">
-                <table>
-                    <tr>
-                        <th>Nome</th>
-                        <th>E-mail</th>
-                        <th>Status</th>
-                        <th>Comprovante</th>
-                        <th>Ação</th>
-                    </tr>
+    foto = request.files.get("foto")
+    nome_foto = None
 
-                    {linhas}
-                </table>
-            </div>
+    if foto and foto.filename:
+        extensao = Path(secure_filename(foto.filename)).suffix.lower()
+        if extensao not in [".jpg", ".jpeg", ".png", ".webp"]:
+            flash("Use uma imagem JPG, PNG ou WEBP.")
+            return redirect(url_for("admin"))
+        nome_foto = uuid.uuid4().hex + extensao
+        foto.save(UPLOAD_DIR / nome_foto)
 
-            <p><a href="/admin/sair">Sair da administração</a></p>
-        </div>
-    """)
-
-
-@app.route("/admin/aprovar/<int:id>", methods=["POST"])
-def aprovar(id):
-
-    if not session.get("admin"):
-        return redirect("/admin/login")
-
-    with conectar() as banco:
-        banco.execute(
-            "UPDATE usuarios SET status = 'aprovado' WHERE id = ?",
-            (id,)
+    with conectar() as con:
+        con.execute(
+            "INSERT INTO produtos (nome,descricao,preco,estoque,foto) VALUES (?,?,?,?,?)",
+            (nome, descricao, preco, estoque, nome_foto)
         )
 
-    flash("Conta aprovada.")
-    return redirect("/admin")
+    flash("Produto cadastrado!")
+    return redirect(url_for("admin"))
 
+@app.route("/admin/editar/<int:produto_id>", methods=["POST"])
+@admin_obrigatorio
+def admin_editar(produto_id):
+    try:
+        nome = request.form.get("nome", "").strip()
+        descricao = request.form.get("descricao", "").strip()
+        preco = float(request.form.get("preco", "0"))
+        estoque = int(request.form.get("estoque", "0"))
+        if not nome or preco < 0 or estoque < 0:
+            raise ValueError()
+    except ValueError:
+        flash("Confira os dados do produto.")
+        return redirect(url_for("admin"))
+
+    with conectar() as con:
+        con.execute(
+            "UPDATE produtos SET nome=?,descricao=?,preco=?,estoque=? WHERE id=?",
+            (nome, descricao, preco, estoque, produto_id)
+        )
+
+    flash("Produto atualizado!")
+    return redirect(url_for("admin"))
+
+@app.route("/admin/excluir/<int:produto_id>", methods=["POST"])
+@admin_obrigatorio
+def admin_excluir(produto_id):
+    with conectar() as con:
+        con.execute("DELETE FROM produtos WHERE id=?", (produto_id,))
+    flash("Produto excluído.")
+    return redirect(url_for("admin"))
 
 @app.route("/admin/sair")
 def admin_sair():
-    session.pop("admin", None)
-    return redirect("/admin/login")
-
-
-# --------------------------------------------------
-# VERIFICAÇÃO DO SERVIDOR
-# --------------------------------------------------
-
-@app.route("/health")
-def health():
-    try:
-        with conectar() as banco:
-            banco.execute("SELECT 1")
-
-        return {"status": "ok", "banco": "conectado"}, 200
-
-    except sqlite3.Error:
-        app.logger.exception("Erro na verificação do banco")
-        return {"status": "erro", "banco": "indisponível"}, 500
-
-
-# --------------------------------------------------
-# INICIAR LOCALMENTE
-# --------------------------------------------------
+    session.clear()
+    return redirect(url_for("inicio"))
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(debug=True)

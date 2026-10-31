@@ -1,635 +1,687 @@
 
 import os
 import sqlite3
-from pathlib import Path
 from functools import wraps
-
 from flask import (
     Flask, request, redirect, session,
-    flash, render_template_string
+    flash, render_template_string, url_for
 )
 from werkzeug.security import generate_password_hash, check_password_hash
-from markupsafe import escape
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "devconnect-secret-change-me")
 
-# CONFIGURAÇÕES
-app.secret_key = os.environ.get(
-    "SECRET_KEY", "troque-esta-chave-por-uma-chave-secreta"
-)
-
-BASE_DIR = Path(__file__).resolve().parent
-BANCO = BASE_DIR / "boletim.db"
-
-CHAVE_PIX = os.environ.get("CHAVE_PIX", "COLOQUE_SUA_CHAVE_PIX")
-NOME_PIX = os.environ.get("NOME_PIX", "SEU NOME")
-VALOR = "10,00"
-
-SENHA_ADMIN = os.environ.get("SENHA_ADMIN", "Jotta@123")
+DB = "devconnect.db"
 
 
-# --------------------------------------------------
-# BANCO DE DADOS
-# --------------------------------------------------
-
-def conectar():
-    banco = sqlite3.connect(str(BANCO), timeout=30)
-    banco.row_factory = sqlite3.Row
-    return banco
+def db():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def criar_banco():
-    with conectar() as banco:
-        banco.execute("""
-            CREATE TABLE IF NOT EXISTS usuarios (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                senha TEXT NOT NULL,
-                status TEXT DEFAULT 'pendente',
-                comprovante TEXT
-            )
-        """)
+def init_db():
+    conn = db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        role TEXT NOT NULL,
+        bio TEXT DEFAULT '',
+        skills TEXT DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        budget TEXT DEFAULT '',
+        status TEXT DEFAULT 'Aberto'
+    );
+
+    CREATE TABLE IF NOT EXISTS proposals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        developer_id INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        price TEXT DEFAULT '',
+        UNIQUE(project_id, developer_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender_id INTEGER NOT NULL,
+        receiver_id INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reviewer_id INTEGER NOT NULL,
+        developer_id INTEGER NOT NULL,
+        rating INTEGER NOT NULL,
+        comment TEXT DEFAULT ''
+    );
+    """)
+    conn.commit()
+    conn.close()
 
 
-# IMPORTANTE: executa também quando o Gunicorn inicia o app no Render.
-criar_banco()
+init_db()
 
 
-# --------------------------------------------------
-# USUÁRIO E PROTEÇÃO DE PÁGINAS
-# --------------------------------------------------
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            flash("Faça login para continuar.")
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
 
-def usuario_atual():
-    usuario_id = session.get("usuario")
 
-    if not usuario_id:
+def current_user():
+    if not session.get("user_id"):
         return None
-
-    with conectar() as banco:
-        return banco.execute(
-            "SELECT * FROM usuarios WHERE id = ?",
-            (usuario_id,)
-        ).fetchone()
-
-
-def proteger(funcao):
-    @wraps(funcao)
-    def verificar(*args, **kwargs):
-        if not usuario_atual():
-            return redirect("/login")
-        return funcao(*args, **kwargs)
-    return verificar
+    conn = db()
+    user = conn.execute(
+        "SELECT * FROM users WHERE id=?",
+        (session["user_id"],)
+    ).fetchone()
+    conn.close()
+    return user
 
 
-def liberar(funcao):
-    @wraps(funcao)
-    def verificar(*args, **kwargs):
-        usuario = usuario_atual()
-
-        if not usuario:
-            return redirect("/login")
-
-        if usuario["status"] != "aprovado":
-            return redirect("/pagamento")
-
-        return funcao(*args, **kwargs)
-    return verificar
-
-
-# --------------------------------------------------
-# VISUAL DO SITE
-# --------------------------------------------------
-
-def pagina(titulo, conteudo):
-    usuario = usuario_atual()
-
-    menu = """
-        <a href="/">Início</a>
-        <a href="/criar-conta">Criar conta</a>
-        <a href="/login">Login</a>
-    """
-
-    if usuario:
-        menu = """
-            <a href="/boletim">Meu boletim</a>
-            <a href="/pagamento">Pagamento</a>
-            <a href="/sair">Sair</a>
-        """
-
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html lang="pt-br">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>{{ titulo }} - Meu Boletim</title>
-
-        <style>
-            * { box-sizing: border-box; }
-
-            body {
-                margin: 0;
-                background: #f1f4fa;
-                font-family: Arial, sans-serif;
-                color: #18233a;
-            }
-
-            header {
-                background: #101b35;
-                color: white;
-                padding: 22px 8%;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                flex-wrap: wrap;
-                gap: 15px;
-            }
-
-            header strong { font-size: 22px; }
-
-            header a {
-                color: white;
-                text-decoration: none;
-                margin-left: 15px;
-            }
-
-            main {
-                max-width: 850px;
-                margin: 50px auto;
-                padding: 0 18px;
-            }
-
-            .card {
-                background: white;
-                padding: 35px;
-                border-radius: 18px;
-                box-shadow: 0 8px 30px #00000010;
-            }
-
-            h1 { font-size: 30px; }
-
-            p {
-                color: #647087;
-                line-height: 1.6;
-            }
-
-            input, textarea {
-                width: 100%;
-                padding: 14px;
-                border: 1px solid #d9dfeb;
-                border-radius: 9px;
-                margin: 8px 0 18px;
-                font-size: 15px;
-            }
-
-            label { font-weight: bold; }
-
-            button, .botao {
-                display: inline-block;
-                background: #315efb;
-                color: white;
-                padding: 14px 20px;
-                border: none;
-                border-radius: 9px;
-                text-decoration: none;
-                cursor: pointer;
-                font-weight: bold;
-            }
-
-            .botao-secundario {
-                background: #101b35;
-            }
-
-            .pix {
-                background: #f0f3ff;
-                padding: 18px;
-                border-radius: 12px;
-                overflow-wrap: anywhere;
-            }
-
-            .mensagem {
-                background: #fff1c9;
-                padding: 13px;
-                border-radius: 9px;
-                margin-bottom: 15px;
-            }
-
-            table {
-                width: 100%;
-                border-collapse: collapse;
-            }
-
-            td, th {
-                padding: 10px;
-                border-bottom: 1px solid #ddd;
-                text-align: left;
-            }
-
-            @media(max-width: 600px) {
-                header { padding: 20px; }
-                header a { margin-left: 5px; }
-                .card { padding: 22px; }
-                h1 { font-size: 25px; }
-            }
-        </style>
-    </head>
-
-    <body>
-        <header>
-            <strong>MEU BOLETIM</strong>
-            <nav>{{ menu|safe }}</nav>
-        </header>
-
-        <main>
-            {% for mensagem in get_flashed_messages() %}
-                <div class="mensagem">{{ mensagem }}</div>
-            {% endfor %}
-
-            {{ conteudo|safe }}
-        </main>
-    </body>
-    </html>
-    """, titulo=titulo, conteudo=conteudo, menu=menu)
+BASE = """
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} | DevConnect</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b1020;color:#f5f6fa;font-family:Arial,sans-serif}
+nav{background:#111a30;padding:18px 6%;display:flex;justify-content:space-between;align-items:center;gap:15px;flex-wrap:wrap}
+.logo{font-size:24px;font-weight:bold;color:#a78bfa;text-decoration:none}
+nav a{color:#ddd;text-decoration:none;margin-left:15px}
+.container{max-width:1050px;margin:35px auto;padding:0 18px}
+h1,h2{color:#fff}
+p{color:#b9c1d3;line-height:1.6}
+.card{background:#151e34;border:1px solid #293653;padding:22px;border-radius:14px;margin:15px 0}
+input,textarea,select{width:100%;padding:13px;margin:9px 0 15px;background:#0d1528;color:white;border:1px solid #394765;border-radius:8px}
+textarea{min-height:110px}
+button,.btn{background:#7c3aed;color:white;border:0;padding:12px 18px;border-radius:8px;cursor:pointer;text-decoration:none;display:inline-block;font-weight:bold}
+button:hover,.btn:hover{background:#6d28d9}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:15px}
+.tag{background:#292044;color:#c4b5fd;padding:6px 10px;border-radius:20px;font-size:12px}
+.flash{background:#35274c;padding:12px;border-radius:8px;margin:12px 0}
+small{color:#9ca3af}
+a{color:#c4b5fd}
+footer{text-align:center;color:#77839d;padding:35px}
+</style>
+</head>
+<body>
+<nav>
+<a class="logo" href="{{ url_for('home') }}">DevConnect.</a>
+<div>
+{% if user %}
+<a href="{{ url_for('home') }}">Início</a>
+<a href="{{ url_for('projects') }}">Projetos</a>
+<a href="{{ url_for('developers') }}">Desenvolvedores</a>
+<a href="{{ url_for('inbox') }}">Mensagens</a>
+<a href="{{ url_for('logout') }}">Sair</a>
+{% else %}
+<a href="{{ url_for('login') }}">Entrar</a>
+<a href="{{ url_for('register') }}">Cadastrar</a>
+{% endif %}
+</div>
+</nav>
+<div class="container">
+{% for msg in get_flashed_messages() %}
+<div class="flash">{{ msg }}</div>
+{% endfor %}
+{{ content|safe }}
+</div>
+<footer>DevConnect © 2026 — Conectando ideias e desenvolvedores.</footer>
+</body>
+</html>
+"""
 
 
-# --------------------------------------------------
-# PÁGINA INICIAL
-# --------------------------------------------------
+def page(title, content, **kwargs):
+    return render_template_string(
+        BASE,
+        title=title,
+        content=render_template_string(content, **kwargs),
+        user=current_user()
+    )
+
 
 @app.route("/")
-def inicio():
-    return pagina("Início", """
-        <div class="card">
-            <h1>Bem-vindo ao Meu Boletim!</h1>
+def home():
+    user = current_user()
+    conn = db()
+    projects = conn.execute(
+        """SELECT projects.*, users.name
+           FROM projects JOIN users ON users.id=projects.user_id
+           WHERE status='Aberto' ORDER BY projects.id DESC LIMIT 6"""
+    ).fetchall()
+    developers = conn.execute(
+        "SELECT * FROM users WHERE role='developer' ORDER BY id DESC LIMIT 4"
+    ).fetchall()
+    conn.close()
 
-            <p>
-                Organize suas notas escolares em um só lugar.
-                Acompanhe seu desempenho durante o ano letivo.
-            </p>
+    return page("Início", """
+    <div class="card">
+      <h1>Encontre o desenvolvedor ideal para sua ideia.</h1>
+      <p>Publique seu projeto, receba propostas e encontre profissionais para transformar sua ideia em realidade.</p>
+      {% if not user %}
+      <a class="btn" href="{{ url_for('register') }}">Começar gratuitamente</a>
+      {% else %}
+      <a class="btn" href="{{ url_for('projects') }}">Explorar projetos</a>
+      {% endif %}
+    </div>
 
-            <a class="botao" href="/criar-conta">CRIAR CONTA</a>
-            <a class="botao botao-secundario" href="/login">
-                FAZER LOGIN
-            </a>
-        </div>
-    """)
+    <h2>Projetos recentes</h2>
+    <div class="grid">
+    {% for p in projects %}
+      <div class="card">
+        <h3>{{ p.title }}</h3>
+        <p>{{ p.description[:120] }}</p>
+        <small>Publicado por {{ p.name }}</small><br><br>
+        <a href="{{ url_for('project_detail', project_id=p.id) }}">Ver projeto →</a>
+      </div>
+    {% else %}
+      <p>Nenhum projeto publicado ainda.</p>
+    {% endfor %}
+    </div>
+
+    <h2>Desenvolvedores</h2>
+    <div class="grid">
+    {% for d in developers %}
+      <div class="card">
+        <h3>{{ d.name }}</h3>
+        <p>{{ d.bio or 'Desenvolvedor na DevConnect.' }}</p>
+        <span class="tag">{{ d.skills or 'Desenvolvimento web' }}</span>
+      </div>
+    {% endfor %}
+    </div>
+    """, projects=projects, developers=developers, user=user)
 
 
-# --------------------------------------------------
-# CADASTRO
-# --------------------------------------------------
-
-@app.route("/criar-conta", methods=["GET", "POST"])
-def criar_conta():
-
+@app.route("/register", methods=["GET", "POST"])
+def register():
     if request.method == "POST":
-        nome = request.form.get("nome", "").strip()
+        name = request.form.get("name", "").strip()
         email = request.form.get("email", "").strip().lower()
-        senha = request.form.get("senha", "")
+        password = request.form.get("password", "")
+        role = request.form.get("role", "")
+        
+        if not name or not email or len(password) < 6:
+            flash("Preencha os campos. A senha precisa ter pelo menos 6 caracteres.")
+            return redirect(url_for("register"))
 
-        if not nome or not email or len(senha) < 6:
-            flash("Preencha todos os campos. A senha precisa ter pelo menos 6 caracteres.")
-            return redirect("/criar-conta")
+        if role not in ("client", "developer"):
+            flash("Selecione um tipo de conta válido.")
+            return redirect(url_for("register"))
 
+        conn = db()
         try:
-            with conectar() as banco:
-                cursor = banco.execute("""
-                    INSERT INTO usuarios (nome, email, senha)
-                    VALUES (?, ?, ?)
-                """, (
-                    nome,
-                    email,
-                    generate_password_hash(senha)
-                ))
-
-                novo_id = cursor.lastrowid
-
-            session["usuario"] = novo_id
-            return redirect("/pagamento")
-
+            conn.execute(
+                "INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)",
+                (name, email, generate_password_hash(password), role)
+            )
+            conn.commit()
+            flash("Conta criada! Agora faça login.")
+            return redirect(url_for("login"))
         except sqlite3.IntegrityError:
-            flash("Este e-mail já está cadastrado.")
-            return redirect("/criar-conta")
+            flash("Este email já está cadastrado.")
+        finally:
+            conn.close()
 
-        except sqlite3.Error:
-            app.logger.exception("Erro ao cadastrar usuário")
-            flash("Não foi possível realizar o cadastro. Tente novamente.")
-            return redirect("/criar-conta")
-
-    return pagina("Criar conta", """
-        <div class="card">
-            <h1>Criar minha conta</h1>
-
-            <form method="POST">
-                <label>Nome completo</label>
-                <input name="nome" required maxlength="120">
-
-                <label>E-mail</label>
-                <input name="email" type="email" required>
-
-                <label>Senha</label>
-                <input name="senha" type="password"
-                       minlength="6" required>
-
-                <button type="submit">CADASTRAR E CONTINUAR</button>
-            </form>
-
-            <p>Já possui conta? <a href="/login">Entre aqui</a>.</p>
-        </div>
+    return page("Cadastro", """
+    <div class="card">
+    <h1>Criar conta</h1>
+    <p>Cadastre-se gratuitamente.</p>
+    <form method="POST">
+      <label>Nome</label>
+      <input name="name" required placeholder="Seu nome">
+      <label>Email</label>
+      <input name="email" type="email" required placeholder="seu@email.com">
+      <label>Senha</label>
+      <input name="password" type="password" required minlength="6">
+      <label>Quero me cadastrar como:</label>
+      <select name="role" required>
+        <option value="client">Cliente — preciso de um site</option>
+        <option value="developer">Desenvolvedor — quero encontrar projetos</option>
+      </select>
+      <button type="submit">Criar minha conta grátis</button>
+    </form>
+    </div>
     """)
 
-
-# --------------------------------------------------
-# LOGIN
-# --------------------------------------------------
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
-        senha = request.form.get("senha", "")
+        password = request.form.get("password", "")
+        conn = db()
+        user = conn.execute(
+            "SELECT * FROM users WHERE email=?", (email,)
+        ).fetchone()
+        conn.close()
 
-        with conectar() as banco:
-            usuario = banco.execute(
-                "SELECT * FROM usuarios WHERE email = ?",
-                (email,)
-            ).fetchone()
-
-        if usuario and check_password_hash(usuario["senha"], senha):
+        if user and check_password_hash(user["password"], password):
             session.clear()
-            session["usuario"] = usuario["id"]
+            session["user_id"] = user["id"]
+            flash("Bem-vindo ao DevConnect!")
+            return redirect(url_for("home"))
 
-            if usuario["status"] == "aprovado":
-                return redirect("/boletim")
+        flash("Email ou senha incorretos.")
 
-            return redirect("/pagamento")
-
-        flash("E-mail ou senha incorretos.")
-
-    return pagina("Login", """
-        <div class="card">
-            <h1>Entrar na minha conta</h1>
-
-            <form method="POST">
-                <label>E-mail</label>
-                <input name="email" type="email" required>
-
-                <label>Senha</label>
-                <input name="senha" type="password" required>
-
-                <button type="submit">ENTRAR</button>
-            </form>
-
-            <p>Não tem conta? <a href="/criar-conta">Cadastre-se</a>.</p>
-        </div>
+    return page("Login", """
+    <div class="card">
+    <h1>Entrar na conta</h1>
+    <form method="POST">
+      <label>Email</label>
+      <input name="email" type="email" required>
+      <label>Senha</label>
+      <input name="password" type="password" required>
+      <button>Entrar</button>
+    </form>
+    <p>Não tem conta? <a href="{{ url_for('register') }}">Cadastre-se</a></p>
+    </div>
     """)
 
 
-# --------------------------------------------------
-# PAGAMENTO
-# --------------------------------------------------
-
-@app.route("/pagamento", methods=["GET", "POST"])
-@proteger
-def pagamento():
-
-    usuario = usuario_atual()
-
-    if usuario["status"] == "aprovado":
-        return redirect("/boletim")
-
-    if request.method == "POST":
-        comprovante = request.form.get("comprovante", "").strip()
-
-        if not comprovante:
-            flash("Informe os dados do comprovante.")
-            return redirect("/pagamento")
-
-        with conectar() as banco:
-            banco.execute("""
-                UPDATE usuarios
-                SET comprovante = ?, status = 'em análise'
-                WHERE id = ?
-            """, (comprovante, usuario["id"]))
-
-        flash("Comprovante enviado! Aguarde a aprovação.")
-        return redirect("/pagamento")
-
-    return pagina("Pagamento", f"""
-        <div class="card">
-            <h1>Pagamento</h1>
-
-            <p>
-                Para solicitar a liberação do acesso,
-                realize o pagamento via Pix.
-            </p>
-
-            <div class="pix">
-                <h2>R$ {VALOR}</h2>
-
-                <p><strong>Chave Pix:</strong>
-                {escape(CHAVE_PIX)}</p>
-
-                <p><strong>Recebedor:</strong>
-                {escape(NOME_PIX)}</p>
-            </div>
-
-            <p>Status: <strong>{escape(usuario["status"])}</strong></p>
-
-            <form method="POST">
-                <label>Comprovante ou identificação do pagamento</label>
-
-                <textarea name="comprovante" required
-                    placeholder="Informe os dados ou link do comprovante"
-                ></textarea>
-
-                <button type="submit">ENVIAR COMPROVANTE</button>
-            </form>
-
-            <p>
-                O administrador verificará o recebimento antes
-                de liberar sua conta.
-            </p>
-        </div>
-    """)
-
-
-# --------------------------------------------------
-# BOLETIM
-# --------------------------------------------------
-
-@app.route("/boletim")
-@liberar
-def boletim():
-
-    usuario = usuario_atual()
-
-    return pagina("Meu boletim", f"""
-        <div class="card">
-            <h1>Olá, {escape(usuario["nome"])}!</h1>
-
-            <p>Sua conta foi aprovada.</p>
-
-            <h2>Meu boletim escolar</h2>
-
-            <p>
-                Seu acesso está liberado.
-                Aqui ficará seu controle de notas.
-            </p>
-        </div>
-    """)
-
-
-# --------------------------------------------------
-# SAIR DA CONTA
-# --------------------------------------------------
-
-@app.route("/sair")
-def sair():
+@app.route("/logout")
+def logout():
     session.clear()
-    return redirect("/")
+    return redirect(url_for("home"))
 
 
-# --------------------------------------------------
-# ADMINISTRADOR
-# --------------------------------------------------
+@app.route("/projects")
+def projects():
+    conn = db()
+    items = conn.execute("""
+        SELECT projects.*, users.name
+        FROM projects JOIN users ON users.id=projects.user_id
+        WHERE projects.status='Aberto'
+        ORDER BY projects.id DESC
+    """).fetchall()
+    conn.close()
 
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
+    return page("Projetos", """
+    <h1>Projetos disponíveis</h1>
+    {% if user and user.role == 'client' %}
+    <a class="btn" href="{{ url_for('new_project') }}">+ Publicar projeto</a>
+    {% endif %}
+    {% for p in items %}
+    <div class="card">
+      <h2>{{ p.title }}</h2>
+      <p>{{ p.description }}</p>
+      <small>Cliente: {{ p.name }} | Orçamento: {{ p.budget or 'A combinar' }}</small><br><br>
+      <a href="{{ url_for('project_detail', project_id=p.id) }}">Ver detalhes →</a>
+    </div>
+    {% else %}
+    <p>Nenhum projeto disponível.</p>
+    {% endfor %}
+    """, items=items)
+
+
+@app.route("/project/new", methods=["GET", "POST"])
+@login_required
+def new_project():
+    user = current_user()
+    if user["role"] != "client":
+        flash("Somente clientes podem publicar projetos.")
+        return redirect(url_for("projects"))
 
     if request.method == "POST":
-        senha = request.form.get("senha", "")
+        title = request.form.get("title", "").strip()
+        description = request.form.get("description", "").strip()
+        budget = request.form.get("budget", "").strip()
 
-        if senha == SENHA_ADMIN:
-            session["admin"] = True
-            return redirect("/admin")
+        if title and description:
+            conn = db()
+            conn.execute(
+                "INSERT INTO projects(user_id,title,description,budget) VALUES(?,?,?,?)",
+                (user["id"], title, description, budget)
+            )
+            conn.commit()
+            conn.close()
+            flash("Projeto publicado gratuitamente!")
+            return redirect(url_for("projects"))
 
-        flash("Senha incorreta.")
-
-    return pagina("Administração", """
-        <div class="card">
-            <h1>Área administrativa</h1>
-
-            <form method="POST">
-                <label>Senha do administrador</label>
-                <input name="senha" type="password" required>
-
-                <button type="submit">ENTRAR</button>
-            </form>
-        </div>
+    return page("Novo projeto", """
+    <div class="card">
+    <h1>Publicar projeto</h1>
+    <form method="POST">
+      <label>Nome do projeto</label>
+      <input name="title" required placeholder="Ex: Criar loja virtual">
+      <label>Descreva o que você precisa</label>
+      <textarea name="description" required placeholder="Explique como deseja seu site..."></textarea>
+      <label>Orçamento (opcional)</label>
+      <input name="budget" placeholder="Ex: R$ 500 ou a combinar">
+      <button>Publicar gratuitamente</button>
+    </form>
+    </div>
     """)
+
+
+@app.route("/project/<int:project_id>", methods=["GET", "POST"])
+def project_detail(project_id):
+    conn = db()
+    project = conn.execute("""
+        SELECT projects.*, users.name, users.id AS owner_id
+        FROM projects JOIN users ON users.id=projects.user_id
+        WHERE projects.id=?
+    """, (project_id,)).fetchone()
+
+    if not project:
+        conn.close()
+        return "Projeto não encontrado", 404
+
+    user = current_user()
+
+    if request.method == "POST":
+        if not user:
+            conn.close()
+            return redirect(url_for("login"))
+
+        if user["role"] != "developer":
+            flash("Somente desenvolvedores podem enviar propostas.")
+        elif user["id"] == project["owner_id"]:
+            flash("Você não pode enviar proposta para seu próprio projeto.")
+        else:
+            message = request.form.get("message", "").strip()
+            price = request.form.get("price", "").strip()
+            if message:
+                try:
+                    conn.execute(
+                        "INSERT INTO proposals(project_id,developer_id,message,price) VALUES(?,?,?,?)",
+                        (project_id, user["id"], message, price)
+                    )
+                    conn.commit()
+                    flash("Proposta enviada gratuitamente!")
+                except sqlite3.IntegrityError:
+                    flash("Você já enviou uma proposta para este projeto.")
+
+    proposals = conn.execute("""
+        SELECT proposals.*, users.name, users.skills
+        FROM proposals JOIN users ON users.id=proposals.developer_id
+        WHERE project_id=?
+        ORDER BY proposals.id DESC
+    """, (project_id,)).fetchall()
+
+    conn.close()
+
+    return page("Detalhes do projeto", """
+    <div class="card">
+      <h1>{{ project.title }}</h1>
+      <p>{{ project.description }}</p>
+      <p>Cliente: {{ project.name }}</p>
+      <p>Orçamento: {{ project.budget or 'A combinar' }}</p>
+    </div>
+
+    {% if user and user.role == 'developer' %}
+    <div class="card">
+      <h2>Enviar proposta</h2>
+      <form method="POST">
+        <textarea name="message" required placeholder="Explique como você pode desenvolver este projeto"></textarea>
+        <input name="price" placeholder="Seu orçamento (opcional)">
+        <button>Enviar proposta grátis</button>
+      </form>
+    </div>
+    {% endif %}
+
+    <h2>Propostas recebidas</h2>
+    {% if user and user.id == project.owner_id %}
+      {% for p in proposals %}
+      <div class="card">
+        <h3>{{ p.name }}</h3>
+        <p>{{ p.message }}</p>
+        <p>Orçamento: {{ p.price or 'A combinar' }}</p>
+        <a href="{{ url_for('chat', receiver_id=p.developer_id) }}">Conversar com desenvolvedor</a>
+      </div>
+      {% else %}
+      <p>Ainda não há propostas.</p>
+      {% endfor %}
+    {% else %}
+      <p>As propostas são visíveis somente ao cliente que publicou o projeto.</p>
+    {% endif %}
+    """, project=project, proposals=proposals, user=user)
+
+
+@app.route("/developers")
+def developers():
+    conn = db()
+    items = conn.execute(
+        "SELECT * FROM users WHERE role='developer' ORDER BY id DESC"
+    ).fetchall()
+    conn.close()
+
+    return page("Desenvolvedores", """
+    <h1>Encontre profissionais</h1>
+    <div class="grid">
+    {% for d in items %}
+      <div class="card">
+        <h2>{{ d.name }}</h2>
+        <p>{{ d.bio or 'Desenvolvedor disponível para projetos.' }}</p>
+        <span class="tag">{{ d.skills or 'Desenvolvimento web' }}</span>
+        {% if user and user.role == 'client' %}
+        <p><a href="{{ url_for('chat', receiver_id=d.id) }}">Enviar mensagem →</a></p>
+        {% endif %}
+      </div>
+    {% else %}
+      <p>Nenhum desenvolvedor cadastrado.</p>
+    {% endfor %}
+    </div>
+    """, items=items)
+
+
+@app.route("/profile", methods=["GET", "POST"])
+@login_required
+def profile():
+    user = current_user()
+
+    if request.method == "POST":
+        conn = db()
+        conn.execute(
+            "UPDATE users SET bio=?, skills=? WHERE id=?",
+            (
+                request.form.get("bio", "")[:1000],
+                request.form.get("skills", "")[:300],
+                user["id"]
+            )
+        )
+        conn.commit()
+        conn.close()
+        flash("Perfil atualizado!")
+        return redirect(url_for("profile"))
+
+    return page("Meu perfil", """
+    <div class="card">
+    <h1>Meu perfil</h1>
+    <p>{{ user.name }} — {{ 'Desenvolvedor' if user.role == 'developer' else 'Cliente' }}</p>
+    <form method="POST">
+      <label>Sobre você</label>
+      <textarea name="bio">{{ user.bio }}</textarea>
+      <label>Especialidades</label>
+      <input name="skills" value="{{ user.skills }}" placeholder="HTML, CSS, Python, Flask...">
+      <button>Salvar perfil</button>
+    </form>
+    </div>
+    """, user=user)
+
+
+@app.route("/chat/<int:receiver_id>", methods=["GET", "POST"])
+@login_required
+def chat(receiver_id):
+    user = current_user()
+    conn = db()
+    receiver = conn.execute(
+        "SELECT * FROM users WHERE id=?", (receiver_id,)
+    ).fetchone()
+
+    if not receiver or receiver_id == user["id"]:
+        conn.close()
+        return "Usuário inválido.", 404
+
+    # Só permite conversas entre cliente e desenvolvedor.
+    if receiver["role"] == user["role"]:
+        conn.close()
+        return "Conversa não permitida.", 403
+
+    if request.method == "POST":
+        message = request.form.get("message", "").strip()
+        if message:
+            conn.execute(
+                "INSERT INTO messages(sender_id,receiver_id,message) VALUES(?,?,?)",
+                (user["id"], receiver_id, message)
+            )
+            conn.commit()
+
+    messages = conn.execute("""
+        SELECT * FROM messages
+        WHERE (sender_id=? AND receiver_id=?)
+        OR (sender_id=? AND receiver_id=?)
+        ORDER BY id ASC
+    """, (user["id"], receiver_id, receiver_id, user["id"])).fetchall()
+
+    conn.close()
+
+    return page("Conversa", """
+    <div class="card">
+      <h2>Conversa com {{ receiver.name }}</h2>
+      {% for m in messages %}
+      <div class="card">
+        <small>{{ 'Você' if m.sender_id == user.id else receiver.name }}</small>
+        <p>{{ m.message }}</p>
+        <small>{{ m.created_at }}</small>
+      </div>
+      {% else %}
+      <p>Comece a conversa!</p>
+      {% endfor %}
+      <form method="POST">
+        <textarea name="message" required placeholder="Digite sua mensagem..."></textarea>
+        <button>Enviar mensagem</button>
+      </form>
+    </div>
+    """, receiver=receiver, messages=messages, user=user)
+
+
+@app.route("/inbox")
+@login_required
+def inbox():
+    user = current_user()
+    conn = db()
+    rows = conn.execute("""
+        SELECT users.id, users.name, MAX(messages.id) AS last_id
+        FROM messages
+        JOIN users ON users.id =
+          CASE WHEN messages.sender_id=? THEN messages.receiver_id
+               ELSE messages.sender_id END
+        WHERE messages.sender_id=? OR messages.receiver_id=?
+        GROUP BY users.id
+        ORDER BY last_id DESC
+    """, (user["id"], user["id"], user["id"])).fetchall()
+    conn.close()
+
+    return page("Mensagens", """
+    <h1>Minhas conversas</h1>
+    {% for r in rows %}
+    <div class="card">
+      <h3>{{ r.name }}</h3>
+      <a href="{{ url_for('chat', receiver_id=r.id) }}">Abrir conversa →</a>
+    </div>
+    {% else %}
+    <p>Você ainda não possui conversas.</p>
+    {% endfor %}
+    """, rows=rows)
+
+
+@app.route("/review/<int:developer_id>", methods=["GET", "POST"])
+@login_required
+def review(developer_id):
+    user = current_user()
+    if user["role"] != "client":
+        return "Somente clientes podem avaliar.", 403
+
+    conn = db()
+    developer = conn.execute(
+        "SELECT * FROM users WHERE id=? AND role='developer'",
+        (developer_id,)
+    ).fetchone()
+
+    if not developer:
+        conn.close()
+        return "Desenvolvedor não encontrado.", 404
+
+    if request.method == "POST":
+        rating = request.form.get("rating", type=int)
+        comment = request.form.get("comment", "").strip()
+
+        if rating not in range(1, 6):
+            flash("Escolha uma nota entre 1 e 5.")
+        else:
+            conn.execute(
+                "INSERT INTO reviews(reviewer_id,developer_id,rating,comment) VALUES(?,?,?,?)",
+                (user["id"], developer_id, rating, comment)
+            )
+            conn.commit()
+            flash("Avaliação enviada!")
+            conn.close()
+            return redirect(url_for("developers"))
+
+    conn.close()
+
+    return page("Avaliar desenvolvedor", """
+    <div class="card">
+    <h1>Avaliar {{ developer.name }}</h1>
+    <form method="POST">
+      <label>Nota</label>
+      <select name="rating">
+        <option value="5">5 - Excelente</option>
+        <option value="4">4 - Muito bom</option>
+        <option value="3">3 - Bom</option>
+        <option value="2">2 - Regular</option>
+        <option value="1">1 - Ruim</option>
+      </select>
+      <label>Comentário</label>
+      <textarea name="comment"></textarea>
+      <button>Enviar avaliação</button>
+    </form>
+    </div>
+    """, developer=developer)
 
 
 @app.route("/admin")
+@login_required
 def admin():
+    # Não existe administrador público ou senha universal.
+    if not session.get("is_admin"):
+        return "Acesso restrito.", 403
 
-    if not session.get("admin"):
-        return redirect("/admin/login")
+    conn = db()
+    users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    projects = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    conn.close()
 
-    with conectar() as banco:
-        usuarios = banco.execute(
-            "SELECT * FROM usuarios ORDER BY id DESC"
-        ).fetchall()
+    return page("Administração", """
+    <h1>Painel administrativo</h1>
+    <div class="grid">
+      <div class="card"><h2>{{ users }}</h2><p>Usuários cadastrados</p></div>
+      <div class="card"><h2>{{ projects }}</h2><p>Projetos publicados</p></div>
+    </div>
+    """, users=users, projects=projects)
 
-    linhas = ""
-
-    for usuario in usuarios:
-        comprovante = escape(
-            usuario["comprovante"] or "Não enviado"
-        )
-
-        acao = ""
-
-        if usuario["status"] != "aprovado":
-            acao = f"""
-                <form method="POST"
-                      action="/admin/aprovar/{usuario['id']}">
-                    <button type="submit">Aprovar conta</button>
-                </form>
-            """
-
-        linhas += f"""
-            <tr>
-                <td>{escape(usuario["nome"])}</td>
-                <td>{escape(usuario["email"])}</td>
-                <td>{escape(usuario["status"])}</td>
-                <td>{comprovante}</td>
-                <td>{acao}</td>
-            </tr>
-        """
-
-    return pagina("Administração", f"""
-        <div class="card">
-            <h1>Gerenciar pagamentos</h1>
-
-            <p>
-                Confira o recebimento no banco antes de aprovar
-                qualquer conta.
-            </p>
-
-            <div style="overflow-x:auto">
-                <table>
-                    <tr>
-                        <th>Nome</th>
-                        <th>E-mail</th>
-                        <th>Status</th>
-                        <th>Comprovante</th>
-                        <th>Ação</th>
-                    </tr>
-
-                    {linhas}
-                </table>
-            </div>
-
-            <p><a href="/admin/sair">Sair da administração</a></p>
-        </div>
-    """)
-
-
-@app.route("/admin/aprovar/<int:id>", methods=["POST"])
-def aprovar(id):
-
-    if not session.get("admin"):
-        return redirect("/admin/login")
-
-    with conectar() as banco:
-        banco.execute(
-            "UPDATE usuarios SET status = 'aprovado' WHERE id = ?",
-            (id,)
-        )
-
-    flash("Conta aprovada.")
-    return redirect("/admin")
-
-
-@app.route("/admin/sair")
-def admin_sair():
-    session.pop("admin", None)
-    return redirect("/admin/login")
-
-
-# --------------------------------------------------
-# VERIFICAÇÃO DO SERVIDOR
-# --------------------------------------------------
-
-@app.route("/health")
-def health():
-    try:
-        with conectar() as banco:
-            banco.execute("SELECT 1")
-
-        return {"status": "ok", "banco": "conectado"}, 200
-
-    except sqlite3.Error:
-        app.logger.exception("Erro na verificação do banco")
-        return {"status": "erro", "banco": "indisponível"}, 500
-
-
-# --------------------------------------------------
-# INICIAR LOCALMENTE
-# --------------------------------------------------
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

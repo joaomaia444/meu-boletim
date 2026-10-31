@@ -1,635 +1,415 @@
 
 import os
 import sqlite3
-from pathlib import Path
+import secrets
+import uuid
+import io
+import base64
 from functools import wraps
+from pathlib import Path
 
-from flask import (
-    Flask, request, redirect, session,
-    flash, render_template_string
-)
-from werkzeug.security import generate_password_hash, check_password_hash
-from markupsafe import escape
+import qrcode
+from flask import Flask, request, redirect, url_for, session, flash, render_template_string, send_from_directory, abort
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "troque-esta-chave-secreta")
 
-# CONFIGURAÇÕES
-app.secret_key = os.environ.get(
-    "SECRET_KEY", "troque-esta-chave-por-uma-chave-secreta"
-)
+PIX_KEY = os.environ.get("PIX_KEY", "maiaj2733@gmail.com")
+PIX_NAME = "JOTTA STORE"
+PIX_CITY = "TEIXEIRA DE FREITAS"
 
-BASE_DIR = Path(__file__).resolve().parent
-BANCO = BASE_DIR / "boletim.db"
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "troque-esta-senha")
 
-CHAVE_PIX = os.environ.get("CHAVE_PIX", "COLOQUE_SUA_CHAVE_PIX")
-NOME_PIX = os.environ.get("NOME_PIX", "SEU NOME")
-VALOR = "10,00"
-
-SENHA_ADMIN = os.environ.get("SENHA_ADMIN", "Jotta@123")
-
-
-# --------------------------------------------------
-# BANCO DE DADOS
-# --------------------------------------------------
+DB = "loja.db"
+UPLOAD = Path("static/uploads")
+UPLOAD.mkdir(parents=True, exist_ok=True)
 
 def conectar():
-    banco = sqlite3.connect(str(BANCO), timeout=30)
-    banco.row_factory = sqlite3.Row
-    return banco
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    return con
 
+def iniciar():
+    with conectar() as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS produtos(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT,
+            descricao TEXT,
+            preco REAL,
+            estoque INTEGER,
+            imagem TEXT
+        )""")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS pedidos(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cliente TEXT,
+            telefone TEXT,
+            produtos TEXT,
+            total REAL,
+            pix TEXT,
+            status TEXT DEFAULT 'Aguardando pagamento'
+        )""")
 
-def criar_banco():
-    with conectar() as banco:
-        banco.execute("""
-            CREATE TABLE IF NOT EXISTS usuarios (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                senha TEXT NOT NULL,
-                status TEXT DEFAULT 'pendente',
-                comprovante TEXT
-            )
-        """)
+iniciar()
 
+def dinheiro(valor):
+    return f"R$ {valor:.2f}".replace(".", ",")
 
-# IMPORTANTE: executa também quando o Gunicorn inicia o app no Render.
-criar_banco()
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin"):
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
 
+def tlv(tag, value):
+    value = str(value)
+    return f"{tag}{len(value):02d}{value}"
 
-# --------------------------------------------------
-# USUÁRIO E PROTEÇÃO DE PÁGINAS
-# --------------------------------------------------
+def crc16(payload):
+    crc = 0xFFFF
+    for byte in payload.encode():
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return f"{crc:04X}"
 
-def usuario_atual():
-    usuario_id = session.get("usuario")
+def gerar_pix(valor, txid):
+    gui = tlv("00", "br.gov.bcb.pix") + tlv("01", PIX_KEY)
+    merchant = tlv("26", gui)
 
-    if not usuario_id:
-        return None
+    payload = (
+        tlv("00", "01") +
+        tlv("01", "12") +
+        merchant +
+        tlv("52", "0000") +
+        tlv("53", "986") +
+        tlv("54", f"{valor:.2f}") +
+        tlv("58", "BR") +
+        tlv("59", PIX_NAME) +
+        tlv("60", PIX_CITY) +
+        tlv("62", tlv("05", txid[:25]))
+    )
 
-    with conectar() as banco:
-        return banco.execute(
-            "SELECT * FROM usuarios WHERE id = ?",
-            (usuario_id,)
-        ).fetchone()
+    parcial = payload + "6304"
+    return parcial + crc16(parcial)
 
+def gerar_qr(codigo):
+    imagem = qrcode.make(codigo)
+    buffer = io.BytesIO()
+    imagem.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
-def proteger(funcao):
-    @wraps(funcao)
-    def verificar(*args, **kwargs):
-        if not usuario_atual():
-            return redirect("/login")
-        return funcao(*args, **kwargs)
-    return verificar
+CSS = """
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f5f5f5;color:#171717;font-family:Arial}
+header{background:#111;color:white;padding:22px;text-align:center}
+header h1{letter-spacing:3px;margin:0}
+nav{background:white;padding:15px;text-align:center}
+nav a{color:#111;margin:10px;text-decoration:none;font-weight:bold}
+main{max-width:1100px;margin:30px auto;padding:15px}
+.banner{background:#111;color:white;padding:45px 25px;border-radius:12px;margin-bottom:25px}
+.banner h2{font-size:35px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:20px}
+.card{background:white;border-radius:10px;overflow:hidden;padding-bottom:15px}
+.card img{width:100%;height:240px;object-fit:cover}
+.card h3,.card p{padding:0 15px}
+.card button{margin-left:15px}
+button,.btn{background:#111;color:white;border:0;padding:12px 18px;border-radius:6px;cursor:pointer;text-decoration:none;display:inline-block}
+input,textarea,select{width:100%;padding:12px;margin:8px 0 15px;border:1px solid #ccc;border-radius:6px}
+.box{background:white;padding:22px;border-radius:10px;margin-bottom:20px}
+table{width:100%;background:white;border-collapse:collapse}
+td,th{padding:12px;border-bottom:1px solid #ddd;text-align:left}
+.qr{width:230px;max-width:100%}
+footer{text-align:center;padding:30px;color:#777}
+</style>
+"""
 
-
-def liberar(funcao):
-    @wraps(funcao)
-    def verificar(*args, **kwargs):
-        usuario = usuario_atual()
-
-        if not usuario:
-            return redirect("/login")
-
-        if usuario["status"] != "aprovado":
-            return redirect("/pagamento")
-
-        return funcao(*args, **kwargs)
-    return verificar
-
-
-# --------------------------------------------------
-# VISUAL DO SITE
-# --------------------------------------------------
-
-def pagina(titulo, conteudo):
-    usuario = usuario_atual()
-
-    menu = """
-        <a href="/">Início</a>
-        <a href="/criar-conta">Criar conta</a>
-        <a href="/login">Login</a>
-    """
-
-    if usuario:
-        menu = """
-            <a href="/boletim">Meu boletim</a>
-            <a href="/pagamento">Pagamento</a>
-            <a href="/sair">Sair</a>
-        """
-
+def pagina(titulo, conteudo, **dados):
     return render_template_string("""
-    <!DOCTYPE html>
-    <html lang="pt-br">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>{{ titulo }} - Meu Boletim</title>
-
-        <style>
-            * { box-sizing: border-box; }
-
-            body {
-                margin: 0;
-                background: #f1f4fa;
-                font-family: Arial, sans-serif;
-                color: #18233a;
-            }
-
-            header {
-                background: #101b35;
-                color: white;
-                padding: 22px 8%;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                flex-wrap: wrap;
-                gap: 15px;
-            }
-
-            header strong { font-size: 22px; }
-
-            header a {
-                color: white;
-                text-decoration: none;
-                margin-left: 15px;
-            }
-
-            main {
-                max-width: 850px;
-                margin: 50px auto;
-                padding: 0 18px;
-            }
-
-            .card {
-                background: white;
-                padding: 35px;
-                border-radius: 18px;
-                box-shadow: 0 8px 30px #00000010;
-            }
-
-            h1 { font-size: 30px; }
-
-            p {
-                color: #647087;
-                line-height: 1.6;
-            }
-
-            input, textarea {
-                width: 100%;
-                padding: 14px;
-                border: 1px solid #d9dfeb;
-                border-radius: 9px;
-                margin: 8px 0 18px;
-                font-size: 15px;
-            }
-
-            label { font-weight: bold; }
-
-            button, .botao {
-                display: inline-block;
-                background: #315efb;
-                color: white;
-                padding: 14px 20px;
-                border: none;
-                border-radius: 9px;
-                text-decoration: none;
-                cursor: pointer;
-                font-weight: bold;
-            }
-
-            .botao-secundario {
-                background: #101b35;
-            }
-
-            .pix {
-                background: #f0f3ff;
-                padding: 18px;
-                border-radius: 12px;
-                overflow-wrap: anywhere;
-            }
-
-            .mensagem {
-                background: #fff1c9;
-                padding: 13px;
-                border-radius: 9px;
-                margin-bottom: 15px;
-            }
-
-            table {
-                width: 100%;
-                border-collapse: collapse;
-            }
-
-            td, th {
-                padding: 10px;
-                border-bottom: 1px solid #ddd;
-                text-align: left;
-            }
-
-            @media(max-width: 600px) {
-                header { padding: 20px; }
-                header a { margin-left: 5px; }
-                .card { padding: 22px; }
-                h1 { font-size: 25px; }
-            }
-        </style>
-    </head>
-
-    <body>
-        <header>
-            <strong>MEU BOLETIM</strong>
-            <nav>{{ menu|safe }}</nav>
-        </header>
-
-        <main>
-            {% for mensagem in get_flashed_messages() %}
-                <div class="mensagem">{{ mensagem }}</div>
-            {% endfor %}
-
-            {{ conteudo|safe }}
-        </main>
-    </body>
-    </html>
-    """, titulo=titulo, conteudo=conteudo, menu=menu)
-
-
-# --------------------------------------------------
-# PÁGINA INICIAL
-# --------------------------------------------------
+    <!DOCTYPE html><html lang="pt-br">
+    <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>{{titulo}} - JOTTA STORE</title>
+    """ + CSS + """
+    </head><body>
+    <header><h1>JOTTA STORE</h1><p>Vista seu estilo.</p></header>
+    <nav><a href="/">INÍCIO</a><a href="/carrinho">CARRINHO</a><a href="/admin">ADMIN</a></nav>
+    <main><h2>{{titulo}}</h2>
+    {% with msgs=get_flashed_messages() %}{% for m in msgs %}<p>{{m}}</p>{% endfor %}{% endwith %}
+    """ + conteudo + """
+    </main><footer>JOTTA STORE © 2026</footer></body></html>
+    """, titulo=titulo, **dados)
 
 @app.route("/")
-def inicio():
-    return pagina("Início", """
-        <div class="card">
-            <h1>Bem-vindo ao Meu Boletim!</h1>
+def home():
+    with conectar() as con:
+        produtos = con.execute("SELECT * FROM produtos ORDER BY id DESC").fetchall()
 
-            <p>
-                Organize suas notas escolares em um só lugar.
-                Acompanhe seu desempenho durante o ano letivo.
-            </p>
+    html = """
+    <section class="banner">
+    <h2>Nova coleção chegou!</h2>
+    <p>Encontre seu estilo na JOTTA STORE.</p>
+    </section>
+    <div class="grid">
+    {% for p in produtos %}
+    <div class="card">
+    {% if p['imagem'] %}
+    <img src="{{url_for('imagem', nome=p['imagem'])}}">
+    {% endif %}
+    <h3>{{p['nome']}}</h3>
+    <p>{{p['descricao']}}</p>
+    <p><b>{{dinheiro(p['preco'])}}</b></p>
+    <p>Estoque: {{p['estoque']}}</p>
+    <form method="post" action="/adicionar/{{p['id']}}">
+    <input type="number" name="quantidade" value="1" min="1" max="{{p['estoque']}}" required>
+    <button {% if p['estoque'] < 1 %}disabled{% endif %}>Adicionar</button>
+    </form></div>
+    {% endfor %}
+    </div>
+    """
+    return pagina("Nossa coleção", html, produtos=produtos, dinheiro=dinheiro)
 
-            <a class="botao" href="/criar-conta">CRIAR CONTA</a>
-            <a class="botao botao-secundario" href="/login">
-                FAZER LOGIN
-            </a>
-        </div>
-    """)
+@app.route("/imagem/<nome>")
+def imagem(nome):
+    return send_from_directory(UPLOAD, nome)
 
+@app.post("/adicionar/<int:id>")
+def adicionar(id):
+    quantidade = max(1, request.form.get("quantidade", 1, type=int))
+    with conectar() as con:
+        p = con.execute("SELECT * FROM produtos WHERE id=?", (id,)).fetchone()
 
-# --------------------------------------------------
-# CADASTRO
-# --------------------------------------------------
+    if not p or p["estoque"] < quantidade:
+        flash("Estoque insuficiente.")
+        return redirect("/")
 
-@app.route("/criar-conta", methods=["GET", "POST"])
-def criar_conta():
+    carrinho = session.get("carrinho", {})
+    carrinho[str(id)] = carrinho.get(str(id), 0) + quantidade
+    session["carrinho"] = carrinho
+    flash("Produto adicionado!")
+    return redirect("/")
+
+@app.route("/carrinho")
+def carrinho():
+    itens = []
+    total = 0
+    with conectar() as con:
+        for pid, quantidade in session.get("carrinho", {}).items():
+            p = con.execute("SELECT * FROM produtos WHERE id=?", (pid,)).fetchone()
+            if p:
+                subtotal = p["preco"] * quantidade
+                total += subtotal
+                itens.append((p, quantidade, subtotal))
+
+    html = """
+    {% for p,q,s in itens %}
+    <div class="box">
+    <h3>{{p['nome']}}</h3>
+    <p>Quantidade: {{q}}</p>
+    <p>Subtotal: {{dinheiro(s)}}</p>
+    <a href="/remover/{{p['id']}}">Remover</a>
+    </div>
+    {% endfor %}
+    <div class="box"><h2>Total: {{dinheiro(total)}}</h2>
+    {% if itens %}<a class="btn" href="/checkout">FINALIZAR COMPRA</a>{% else %}Carrinho vazio{% endif %}
+    </div>
+    """
+    return pagina("Meu carrinho", html, itens=itens, total=total, dinheiro=dinheiro)
+
+@app.route("/remover/<int:id>")
+def remover(id):
+    carrinho = session.get("carrinho", {})
+    carrinho.pop(str(id), None)
+    session["carrinho"] = carrinho
+    return redirect("/carrinho")
+
+@app.route("/checkout", methods=["GET", "POST"])
+def checkout():
+    carrinho = session.get("carrinho", {})
+    if not carrinho:
+        return redirect("/")
+
+    itens = []
+    total = 0
+
+    with conectar() as con:
+        for pid, quantidade in carrinho.items():
+            p = con.execute("SELECT * FROM produtos WHERE id=?", (pid,)).fetchone()
+            if not p or quantidade > p["estoque"]:
+                flash("Estoque insuficiente. Revise seu carrinho.")
+                return redirect("/carrinho")
+            itens.append((p, quantidade))
+            total += p["preco"] * quantidade
 
     if request.method == "POST":
         nome = request.form.get("nome", "").strip()
-        email = request.form.get("email", "").strip().lower()
-        senha = request.form.get("senha", "")
+        telefone = request.form.get("telefone", "").strip()
 
-        if not nome or not email or len(senha) < 6:
-            flash("Preencha todos os campos. A senha precisa ter pelo menos 6 caracteres.")
-            return redirect("/criar-conta")
+        if not nome or not telefone:
+            flash("Preencha seus dados.")
+            return redirect("/checkout")
 
-        try:
-            with conectar() as banco:
-                cursor = banco.execute("""
-                    INSERT INTO usuarios (nome, email, senha)
-                    VALUES (?, ?, ?)
-                """, (
-                    nome,
-                    email,
-                    generate_password_hash(senha)
-                ))
+        txid = uuid.uuid4().hex[:20].upper()
+        pix = gerar_pix(total, txid)
+        resumo = ", ".join(f"{p['nome']} x{q}" for p,q in itens)
 
-                novo_id = cursor.lastrowid
+        with conectar() as con:
+            cur = con.execute("""
+            INSERT INTO pedidos(cliente,telefone,produtos,total,pix)
+            VALUES(?,?,?,?,?)
+            """, (nome, telefone, resumo, total, pix))
+            pedido_id = cur.lastrowid
 
-            session["usuario"] = novo_id
-            return redirect("/pagamento")
+        session["carrinho"] = {}
+        return redirect(f"/pedido/{pedido_id}")
 
-        except sqlite3.IntegrityError:
-            flash("Este e-mail já está cadastrado.")
-            return redirect("/criar-conta")
+    html = """
+    <div class="box">
+    <h3>Total: {{dinheiro(total)}}</h3>
+    <form method="post">
+    <label>Nome completo</label><input name="nome" required>
+    <label>WhatsApp</label><input name="telefone" required>
+    <button>GERAR PIX</button>
+    </form></div>
+    """
+    return pagina("Finalizar compra", html, total=total, dinheiro=dinheiro)
 
-        except sqlite3.Error:
-            app.logger.exception("Erro ao cadastrar usuário")
-            flash("Não foi possível realizar o cadastro. Tente novamente.")
-            return redirect("/criar-conta")
+@app.route("/pedido/<int:id>")
+def pedido(id):
+    with conectar() as con:
+        p = con.execute("SELECT * FROM pedidos WHERE id=?", (id,)).fetchone()
+    if not p:
+        abort(404)
 
-    return pagina("Criar conta", """
-        <div class="card">
-            <h1>Criar minha conta</h1>
+    qr = gerar_qr(p["pix"])
+    html = """
+    <div class="box" style="text-align:center">
+    <h2>Pedido #{{p['id']}} criado!</h2>
+    <p>Total: <b>{{dinheiro(p['total'])}}</b></p>
+    <p>Escaneie o QR Code:</p>
+    <img class="qr" src="{{qr}}">
+    <p>Código Pix copia e cola:</p>
+    <textarea id="pix" rows="5" readonly>{{p['pix']}}</textarea>
+    <button onclick="navigator.clipboard.writeText(document.getElementById('pix').value).then(()=>alert('Pix copiado!'))">COPIAR PIX</button>
+    <p>Após pagar, envie o comprovante para a loja.</p>
+    <p><b>O sistema não confirma pagamentos automaticamente.</b></p>
+    </div>
+    """
+    return pagina("Pagamento Pix", html, p=p, qr=qr, dinheiro=dinheiro)
 
-            <form method="POST">
-                <label>Nome completo</label>
-                <input name="nome" required maxlength="120">
-
-                <label>E-mail</label>
-                <input name="email" type="email" required>
-
-                <label>Senha</label>
-                <input name="senha" type="password"
-                       minlength="6" required>
-
-                <button type="submit">CADASTRAR E CONTINUAR</button>
-            </form>
-
-            <p>Já possui conta? <a href="/login">Entre aqui</a>.</p>
-        </div>
-    """)
-
-
-# --------------------------------------------------
-# LOGIN
-# --------------------------------------------------
-
-@app.route("/login", methods=["GET", "POST"])
+@app.route("/admin", methods=["GET", "POST"])
 def login():
-
+    if session.get("admin"):
+        return redirect("/painel")
     if request.method == "POST":
-        email = request.form.get("email", "").strip().lower()
-        senha = request.form.get("senha", "")
+        if request.form.get("usuario") == ADMIN_USER and request.form.get("senha") == ADMIN_PASSWORD:
+            session["admin"] = True
+            return redirect("/painel")
+        flash("Login incorreto.")
+    html = """
+    <div class="box"><form method="post">
+    <label>Usuário</label><input name="usuario" required>
+    <label>Senha</label><input name="senha" type="password" required>
+    <button>ENTRAR</button></form></div>
+    """
+    return pagina("Área administrativa", html)
 
-        with conectar() as banco:
-            usuario = banco.execute(
-                "SELECT * FROM usuarios WHERE email = ?",
-                (email,)
-            ).fetchone()
+@app.route("/painel")
+@admin_required
+def painel():
+    with conectar() as con:
+        produtos = con.execute("SELECT * FROM produtos ORDER BY id DESC").fetchall()
+        pedidos = con.execute("SELECT * FROM pedidos ORDER BY id DESC").fetchall()
 
-        if usuario and check_password_hash(usuario["senha"], senha):
-            session.clear()
-            session["usuario"] = usuario["id"]
+    html = """
+    <div class="box"><a class="btn" href="/novo-produto">CADASTRAR PRODUTO</a>
+    <a class="btn" href="/sair">SAIR</a></div>
+    <h3>Produtos</h3><table><tr><th>Nome</th><th>Preço</th><th>Estoque</th><th></th></tr>
+    {% for p in produtos %}
+    <tr><td>{{p['nome']}}</td><td>{{dinheiro(p['preco'])}}</td>
+    <td>{{p['estoque']}}</td><td><a href="/editar/{{p['id']}}">Editar</a></td></tr>
+    {% endfor %}</table>
+    <h3>Pedidos</h3><table><tr><th>Número</th><th>Cliente</th><th>Total</th><th>Status</th></tr>
+    {% for p in pedidos %}
+    <tr><td>#{{p['id']}}</td><td>{{p['cliente']}}</td><td>{{dinheiro(p['total'])}}</td><td>{{p['status']}}</td></tr>
+    {% endfor %}</table>
+    """
+    return pagina("Painel da loja", html, produtos=produtos, pedidos=pedidos, dinheiro=dinheiro)
 
-            if usuario["status"] == "aprovado":
-                return redirect("/boletim")
-
-            return redirect("/pagamento")
-
-        flash("E-mail ou senha incorretos.")
-
-    return pagina("Login", """
-        <div class="card">
-            <h1>Entrar na minha conta</h1>
-
-            <form method="POST">
-                <label>E-mail</label>
-                <input name="email" type="email" required>
-
-                <label>Senha</label>
-                <input name="senha" type="password" required>
-
-                <button type="submit">ENTRAR</button>
-            </form>
-
-            <p>Não tem conta? <a href="/criar-conta">Cadastre-se</a>.</p>
-        </div>
-    """)
-
-
-# --------------------------------------------------
-# PAGAMENTO
-# --------------------------------------------------
-
-@app.route("/pagamento", methods=["GET", "POST"])
-@proteger
-def pagamento():
-
-    usuario = usuario_atual()
-
-    if usuario["status"] == "aprovado":
-        return redirect("/boletim")
-
+def formulario_produto(p=None):
     if request.method == "POST":
-        comprovante = request.form.get("comprovante", "").strip()
+        nome = request.form.get("nome", "").strip()
+        descricao = request.form.get("descricao", "").strip()
+        try:
+            preco = float(request.form.get("preco", "0").replace(",", "."))
+            estoque = int(request.form.get("estoque", "0"))
+            if not nome or preco < 0 or estoque < 0:
+                raise ValueError()
+        except ValueError:
+            flash("Confira preço, nome e estoque.")
+            return None
 
-        if not comprovante:
-            flash("Informe os dados do comprovante.")
-            return redirect("/pagamento")
+        foto = p["imagem"] if p else ""
+        arquivo = request.files.get("imagem")
+        if arquivo and arquivo.filename:
+            ext = arquivo.filename.rsplit(".", 1)[-1].lower()
+            if ext not in ("png", "jpg", "jpeg", "webp"):
+                flash("Envie uma imagem PNG, JPG ou WEBP.")
+                return None
+            foto = secrets.token_hex(12) + "." + ext
+            arquivo.save(UPLOAD / foto)
 
-        with conectar() as banco:
-            banco.execute("""
-                UPDATE usuarios
-                SET comprovante = ?, status = 'em análise'
-                WHERE id = ?
-            """, (comprovante, usuario["id"]))
+        with conectar() as con:
+            if p:
+                con.execute("UPDATE produtos SET nome=?,descricao=?,preco=?,estoque=?,imagem=? WHERE id=?",
+                            (nome, descricao, preco, estoque, foto, p["id"]))
+            else:
+                con.execute("INSERT INTO produtos(nome,descricao,preco,estoque,imagem) VALUES(?,?,?,?,?)",
+                            (nome, descricao, preco, estoque, foto))
+        return True
+    return False
 
-        flash("Comprovante enviado! Aguarde a aprovação.")
-        return redirect("/pagamento")
+FORM = """
+<div class="box"><form method="post" enctype="multipart/form-data">
+<label>Nome</label><input name="nome" value="{{p['nome'] if p else ''}}" required>
+<label>Descrição</label><textarea name="descricao">{{p['descricao'] if p else ''}}</textarea>
+<label>Preço</label><input name="preco" value="{{p['preco'] if p else ''}}" required>
+<label>Estoque</label><input name="estoque" type="number" min="0" value="{{p['estoque'] if p else 0}}" required>
+<label>Foto</label><input name="imagem" type="file" accept="image/*">
+<button>SALVAR</button></form></div>
+"""
 
-    return pagina("Pagamento", f"""
-        <div class="card">
-            <h1>Pagamento</h1>
+@app.route("/novo-produto", methods=["GET", "POST"])
+@admin_required
+def novo_produto():
+    resultado = formulario_produto()
+    if resultado:
+        flash("Produto cadastrado!")
+        return redirect("/painel")
+    return pagina("Novo produto", FORM, p=None)
 
-            <p>
-                Para solicitar a liberação do acesso,
-                realize o pagamento via Pix.
-            </p>
-
-            <div class="pix">
-                <h2>R$ {VALOR}</h2>
-
-                <p><strong>Chave Pix:</strong>
-                {escape(CHAVE_PIX)}</p>
-
-                <p><strong>Recebedor:</strong>
-                {escape(NOME_PIX)}</p>
-            </div>
-
-            <p>Status: <strong>{escape(usuario["status"])}</strong></p>
-
-            <form method="POST">
-                <label>Comprovante ou identificação do pagamento</label>
-
-                <textarea name="comprovante" required
-                    placeholder="Informe os dados ou link do comprovante"
-                ></textarea>
-
-                <button type="submit">ENVIAR COMPROVANTE</button>
-            </form>
-
-            <p>
-                O administrador verificará o recebimento antes
-                de liberar sua conta.
-            </p>
-        </div>
-    """)
-
-
-# --------------------------------------------------
-# BOLETIM
-# --------------------------------------------------
-
-@app.route("/boletim")
-@liberar
-def boletim():
-
-    usuario = usuario_atual()
-
-    return pagina("Meu boletim", f"""
-        <div class="card">
-            <h1>Olá, {escape(usuario["nome"])}!</h1>
-
-            <p>Sua conta foi aprovada.</p>
-
-            <h2>Meu boletim escolar</h2>
-
-            <p>
-                Seu acesso está liberado.
-                Aqui ficará seu controle de notas.
-            </p>
-        </div>
-    """)
-
-
-# --------------------------------------------------
-# SAIR DA CONTA
-# --------------------------------------------------
+@app.route("/editar/<int:id>", methods=["GET", "POST"])
+@admin_required
+def editar(id):
+    with conectar() as con:
+        p = con.execute("SELECT * FROM produtos WHERE id=?", (id,)).fetchone()
+    if not p:
+        abort(404)
+    resultado = formulario_produto(p)
+    if resultado:
+        flash("Produto atualizado!")
+        return redirect("/painel")
+    return pagina("Editar produto", FORM, p=p)
 
 @app.route("/sair")
 def sair():
     session.clear()
     return redirect("/")
 
-
-# --------------------------------------------------
-# ADMINISTRADOR
-# --------------------------------------------------
-
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-
-    if request.method == "POST":
-        senha = request.form.get("senha", "")
-
-        if senha == SENHA_ADMIN:
-            session["admin"] = True
-            return redirect("/admin")
-
-        flash("Senha incorreta.")
-
-    return pagina("Administração", """
-        <div class="card">
-            <h1>Área administrativa</h1>
-
-            <form method="POST">
-                <label>Senha do administrador</label>
-                <input name="senha" type="password" required>
-
-                <button type="submit">ENTRAR</button>
-            </form>
-        </div>
-    """)
-
-
-@app.route("/admin")
-def admin():
-
-    if not session.get("admin"):
-        return redirect("/admin/login")
-
-    with conectar() as banco:
-        usuarios = banco.execute(
-            "SELECT * FROM usuarios ORDER BY id DESC"
-        ).fetchall()
-
-    linhas = ""
-
-    for usuario in usuarios:
-        comprovante = escape(
-            usuario["comprovante"] or "Não enviado"
-        )
-
-        acao = ""
-
-        if usuario["status"] != "aprovado":
-            acao = f"""
-                <form method="POST"
-                      action="/admin/aprovar/{usuario['id']}">
-                    <button type="submit">Aprovar conta</button>
-                </form>
-            """
-
-        linhas += f"""
-            <tr>
-                <td>{escape(usuario["nome"])}</td>
-                <td>{escape(usuario["email"])}</td>
-                <td>{escape(usuario["status"])}</td>
-                <td>{comprovante}</td>
-                <td>{acao}</td>
-            </tr>
-        """
-
-    return pagina("Administração", f"""
-        <div class="card">
-            <h1>Gerenciar pagamentos</h1>
-
-            <p>
-                Confira o recebimento no banco antes de aprovar
-                qualquer conta.
-            </p>
-
-            <div style="overflow-x:auto">
-                <table>
-                    <tr>
-                        <th>Nome</th>
-                        <th>E-mail</th>
-                        <th>Status</th>
-                        <th>Comprovante</th>
-                        <th>Ação</th>
-                    </tr>
-
-                    {linhas}
-                </table>
-            </div>
-
-            <p><a href="/admin/sair">Sair da administração</a></p>
-        </div>
-    """)
-
-
-@app.route("/admin/aprovar/<int:id>", methods=["POST"])
-def aprovar(id):
-
-    if not session.get("admin"):
-        return redirect("/admin/login")
-
-    with conectar() as banco:
-        banco.execute(
-            "UPDATE usuarios SET status = 'aprovado' WHERE id = ?",
-            (id,)
-        )
-
-    flash("Conta aprovada.")
-    return redirect("/admin")
-
-
-@app.route("/admin/sair")
-def admin_sair():
-    session.pop("admin", None)
-    return redirect("/admin/login")
-
-
-# --------------------------------------------------
-# VERIFICAÇÃO DO SERVIDOR
-# --------------------------------------------------
-
-@app.route("/health")
-def health():
-    try:
-        with conectar() as banco:
-            banco.execute("SELECT 1")
-
-        return {"status": "ok", "banco": "conectado"}, 200
-
-    except sqlite3.Error:
-        app.logger.exception("Erro na verificação do banco")
-        return {"status": "erro", "banco": "indisponível"}, 500
-
-
-# --------------------------------------------------
-# INICIAR LOCALMENTE
-# --------------------------------------------------
-
 if __name__ == "__main__":
-    app.run(debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
